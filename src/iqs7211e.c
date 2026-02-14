@@ -15,9 +15,9 @@
 #include <zephyr/pm/device.h>
 #include <zephyr/pm/device_runtime.h>
 #include <zephyr/sys/util.h>
+#include <zephyr/devicetree.h>
 
 #include "../include/iqs7211e_reg.h"
-#include "../include/iqs7211e_init.h"
 
 LOG_MODULE_REGISTER(iqs7211e, CONFIG_ZMK_LOG_LEVEL);
 
@@ -25,6 +25,7 @@ LOG_MODULE_REGISTER(iqs7211e, CONFIG_ZMK_LOG_LEVEL);
 
 #if DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT)
 
+#define IQS7211E_INIT_DATA_LEN 217
 #define IQS7211E_TIMEOUT_MS 100
 #define IQS7211E_RESET_DELAY_MS 50
 #define IQS7211E_ATI_TIMEOUT_CYCLES 600 // 30 seconds at 50ms intervals
@@ -33,6 +34,8 @@ struct iqs7211e_config {
     struct i2c_dt_spec i2c;
     struct gpio_dt_spec irq_gpio;
     struct gpio_dt_spec power_gpio;
+    const uint8_t *init_data;
+    size_t init_len;
 };
 
 struct iqs7211e_data {
@@ -214,274 +217,50 @@ static uint16_t iqs7211e_get_product(const struct device *dev) {
     return data->product_number;
 }
 
+static const uint8_t *iqs7211e_find_init_record(const struct iqs7211e_config *cfg, uint8_t reg, uint8_t *out_len) {
+    if (!cfg || !cfg->init_data) {
+        return NULL;
+    }
+    size_t pos = 0;
+    size_t data_len = cfg->init_len ? cfg->init_len : IQS7211E_INIT_DATA_LEN;
+    while (pos + 2 <= data_len) {
+        uint8_t addr = cfg->init_data[pos++];
+        uint8_t len = cfg->init_data[pos++];
+        if (pos + len > data_len) {
+            return NULL;
+        }
+        if (addr == reg) {
+            if (out_len) *out_len = len;
+            return &cfg->init_data[pos];
+        }
+        pos += len;
+    }
+    return NULL;
+}
+
 static int iqs7211e_write_memory_map(const struct device *dev) {
-    uint8_t transfer_bytes[30];
     int ret = 0;
-    
-    LOG_DBG("Writing memory map");
-    
-    // 1. Write ALP Compensation (0x1F - 0x20)
-    iqs7211e_wait_for_ready(dev, 100);
-    transfer_bytes[0] = ALP_COMPENSATION_A_0;
-    transfer_bytes[1] = ALP_COMPENSATION_A_1;
-    transfer_bytes[2] = ALP_COMPENSATION_B_0;
-    transfer_bytes[3] = ALP_COMPENSATION_B_1;
-    ret |= iqs7211e_i2c_write_reg(dev, IQS7211E_MM_ALP_ATI_COMP_A, transfer_bytes, 4);
-    LOG_DBG("\t1. Write ALP Compensation");
-    
-    // 2. Write ATI Settings (0x21 - 0x27)
-    iqs7211e_wait_for_ready(dev, 100);
-    transfer_bytes[0] = TP_ATI_MULTIPLIERS_DIVIDERS_0;
-    transfer_bytes[1] = TP_ATI_MULTIPLIERS_DIVIDERS_1;
-    transfer_bytes[2] = TP_COMPENSATION_DIV;
-    transfer_bytes[3] = TP_REF_DRIFT_LIMIT;
-    transfer_bytes[4] = TP_ATI_TARGET_0;
-    transfer_bytes[5] = TP_ATI_TARGET_1;
-    transfer_bytes[6] = TP_MIN_COUNT_REATI_0;
-    transfer_bytes[7] = TP_MIN_COUNT_REATI_1;
-    transfer_bytes[8] = ALP_ATI_MULTIPLIERS_DIVIDERS_0;
-    transfer_bytes[9] = ALP_ATI_MULTIPLIERS_DIVIDERS_1;
-    transfer_bytes[10] = ALP_COMPENSATION_DIV;
-    transfer_bytes[11] = ALP_LTA_DRIFT_LIMIT;
-    transfer_bytes[12] = ALP_ATI_TARGET_0;
-    transfer_bytes[13] = ALP_ATI_TARGET_1;
-    ret |= iqs7211e_i2c_write_reg(dev, IQS7211E_MM_TP_GLOBAL_MIRRORS, transfer_bytes, 14);
-    LOG_DBG("\t2. Write ATI Settings");
-    
-    // 3. Write Report rates and timings (0x28 - 0x32)
-    iqs7211e_wait_for_ready(dev, 100);
-    transfer_bytes[0]  = ACTIVE_MODE_REPORT_RATE_0;
-    transfer_bytes[1]  = ACTIVE_MODE_REPORT_RATE_1;
-    transfer_bytes[2]  = IDLE_TOUCH_MODE_REPORT_RATE_0;
-    transfer_bytes[3]  = IDLE_TOUCH_MODE_REPORT_RATE_1;
-    transfer_bytes[4]  = IDLE_MODE_REPORT_RATE_0;
-    transfer_bytes[5]  = IDLE_MODE_REPORT_RATE_1;
-    transfer_bytes[6]  = LP1_MODE_REPORT_RATE_0;
-    transfer_bytes[7]  = LP1_MODE_REPORT_RATE_1;
-    transfer_bytes[8]  = LP2_MODE_REPORT_RATE_0;
-    transfer_bytes[9]  = LP2_MODE_REPORT_RATE_1;
-    transfer_bytes[10] = ACTIVE_MODE_TIMEOUT_0;
-    transfer_bytes[11] = ACTIVE_MODE_TIMEOUT_1;
-    transfer_bytes[12] = IDLE_TOUCH_MODE_TIMEOUT_0;
-    transfer_bytes[13] = IDLE_TOUCH_MODE_TIMEOUT_1;
-    transfer_bytes[14] = IDLE_MODE_TIMEOUT_0;
-    transfer_bytes[15] = IDLE_MODE_TIMEOUT_1;
-    transfer_bytes[16] = LP1_MODE_TIMEOUT_0;
-    transfer_bytes[17] = LP1_MODE_TIMEOUT_1;
-    transfer_bytes[18] = REATI_RETRY_TIME;
-    transfer_bytes[19] = REF_UPDATE_TIME;
-    transfer_bytes[20] = I2C_TIMEOUT_0;
-    transfer_bytes[21] = I2C_TIMEOUT_1;
-    ret |= iqs7211e_i2c_write_reg(dev, IQS7211E_MM_ACTIVE_MODE_RR, transfer_bytes, 22);
-    LOG_DBG("\t3. Write Report rates and timings");
+    const struct iqs7211e_config *cfg = dev->config;
 
-    // 4. Write System control settings (0x33 - 0x35)
-    iqs7211e_wait_for_ready(dev, 100);
-    transfer_bytes[0] = SYSTEM_CONTROL_0;
-    transfer_bytes[1] = SYSTEM_CONTROL_1;
-    transfer_bytes[2] = CONFIG_SETTINGS0;
-    transfer_bytes[3] = CONFIG_SETTINGS1;
-    transfer_bytes[4] = OTHER_SETTINGS_0;
-    transfer_bytes[5] = OTHER_SETTINGS_1;
-    ret |= iqs7211e_i2c_write_reg(dev, IQS7211E_MM_SYS_CONTROL, transfer_bytes, 6);
-    LOG_DBG("\t4. Write System control settings");
+    if (!cfg->init_data) {
+        LOG_ERR("No init data provided in config");
+        return -EINVAL;
+    }
 
-    // 5. Write ALP Settings (0x36 - 0x37)
-    iqs7211e_wait_for_ready(dev, 100);
-    transfer_bytes[0] = ALP_SETUP_0;
-    transfer_bytes[1] = ALP_SETUP_1;
-    transfer_bytes[2] = ALP_TX_ENABLE_0;
-    transfer_bytes[3] = ALP_TX_ENABLE_1;
-    ret |= iqs7211e_i2c_write_reg(dev, IQS7211E_MM_ALP_SETUP, transfer_bytes, 4);
-    LOG_DBG("\t5. Write ALP Settings");
+    size_t pos = 0;
+    size_t data_len = cfg->init_len ? cfg->init_len : IQS7211E_INIT_DATA_LEN;
+    while (pos + 2 <= data_len) {
+        uint8_t addr = cfg->init_data[pos++];
+        uint8_t count = cfg->init_data[pos++];
+        if (pos + count > data_len) {
+            LOG_ERR("Init data truncated");
+            return -EINVAL;
+        }
+        iqs7211e_wait_for_ready(dev, 100);
+        ret |= iqs7211e_i2c_write_reg(dev, addr, &cfg->init_data[pos], count);
+        pos += count;
+    }
 
-    // 6. Write Threshold settings (0x38 - 0x3A)
-    iqs7211e_wait_for_ready(dev, 100);
-    transfer_bytes[0] = TRACKPAD_TOUCH_SET_THRESHOLD;
-    transfer_bytes[1] = TRACKPAD_TOUCH_CLEAR_THRESHOLD;
-    transfer_bytes[2] = ALP_THRESHOLD_0;
-    transfer_bytes[3] = ALP_THRESHOLD_1;
-    transfer_bytes[4] = ALP_SET_DEBOUNCE;
-    transfer_bytes[5] = ALP_CLEAR_DEBOUNCE;
-    ret |= iqs7211e_i2c_write_reg(dev, IQS7211E_MM_TP_TOUCH_SET_CLEAR_THR, transfer_bytes, 6);
-    LOG_DBG("\t6. Write Threshold settings");
-
-    // 7. Write Filter Betas (0x3B - 0x3C)
-    iqs7211e_wait_for_ready(dev, 100);
-    transfer_bytes[0] = ALP_COUNT_BETA_LP1;
-    transfer_bytes[1] = ALP_LTA_BETA_LP1;
-    transfer_bytes[2] = ALP_COUNT_BETA_LP2;
-    transfer_bytes[3] = ALP_LTA_BETA_LP2;
-    ret |= iqs7211e_i2c_write_reg(dev, IQS7211E_MM_LP1_FILTERS, transfer_bytes, 4);
-    LOG_DBG("\t7. Write Filter Betas");
-
-    // 8. Write Hardware settings (0x3D - 0x40)
-    iqs7211e_wait_for_ready(dev, 100);
-    transfer_bytes[0] = TP_CONVERSION_FREQUENCY_UP_PASS_LENGTH;
-    transfer_bytes[1] = TP_CONVERSION_FREQUENCY_FRACTION_VALUE;
-    transfer_bytes[2] = ALP_CONVERSION_FREQUENCY_UP_PASS_LENGTH;
-    transfer_bytes[3] = ALP_CONVERSION_FREQUENCY_FRACTION_VALUE;
-    transfer_bytes[4] = TRACKPAD_HARDWARE_SETTINGS_0;
-    transfer_bytes[5] = TRACKPAD_HARDWARE_SETTINGS_1;
-    transfer_bytes[6] = ALP_HARDWARE_SETTINGS_0;
-    transfer_bytes[7] = ALP_HARDWARE_SETTINGS_1;
-    ret |= iqs7211e_i2c_write_reg(dev, IQS7211E_MM_TP_CONV_FREQ, transfer_bytes, 8);
-    LOG_DBG("\t8. Write Hardware settings");
-
-    // 9. Write TP Settings (0x41 - 0x49)
-    iqs7211e_wait_for_ready(dev, 100);
-    transfer_bytes[0]  = TRACKPAD_SETTINGS_0_0;
-    transfer_bytes[1]  = TRACKPAD_SETTINGS_0_1;
-    transfer_bytes[2]  = TRACKPAD_SETTINGS_1_0;
-    transfer_bytes[3]  = TRACKPAD_SETTINGS_1_1;
-    transfer_bytes[4]  = X_RESOLUTION_0;
-    transfer_bytes[5]  = X_RESOLUTION_1;
-    transfer_bytes[6]  = Y_RESOLUTION_0;
-    transfer_bytes[7]  = Y_RESOLUTION_1;
-    transfer_bytes[8]  = XY_DYNAMIC_FILTER_BOTTOM_SPEED_0;
-    transfer_bytes[9]  = XY_DYNAMIC_FILTER_BOTTOM_SPEED_1;
-    transfer_bytes[10] = XY_DYNAMIC_FILTER_TOP_SPEED_0;
-    transfer_bytes[11] = XY_DYNAMIC_FILTER_TOP_SPEED_1;
-    transfer_bytes[12] = XY_DYNAMIC_FILTER_BOTTOM_BETA;
-    transfer_bytes[13] = XY_DYNAMIC_FILTER_STATIC_FILTER_BETA;
-    transfer_bytes[14] = STATIONARY_TOUCH_MOV_THRESHOLD;
-    transfer_bytes[15] = FINGER_SPLIT_FACTOR;
-    transfer_bytes[16] = X_TRIM_VALUE;
-    transfer_bytes[17] = Y_TRIM_VALUE;
-    ret |= iqs7211e_i2c_write_reg(dev, IQS7211E_MM_TP_RX_SETTINGS, transfer_bytes, 18);
-    LOG_DBG("\t9. Write TP Settings");
-
-    // 10. Write Version numbers (0x4A)
-    iqs7211e_wait_for_ready(dev, 100);
-    transfer_bytes[0] = MINOR_VERSION;
-    transfer_bytes[1] = MAJOR_VERSION;
-    ret |= iqs7211e_i2c_write_reg(dev, IQS7211E_MM_SETTINGS_VERSION, transfer_bytes, 2);
-    LOG_DBG("\t10. Write Version numbers");
-
-    // 11. Write Gesture Settings (0x4B - 0x55)
-    iqs7211e_wait_for_ready(dev, 100);
-    transfer_bytes[0]  = GESTURE_ENABLE_0;
-    transfer_bytes[1]  = GESTURE_ENABLE_1;
-    transfer_bytes[2]  = TAP_TOUCH_TIME_0;
-    transfer_bytes[3]  = TAP_TOUCH_TIME_1;
-    transfer_bytes[4]  = TAP_WAIT_TIME_0;
-    transfer_bytes[5]  = TAP_WAIT_TIME_1;
-    transfer_bytes[6]  = TAP_DISTANCE_0;
-    transfer_bytes[7]  = TAP_DISTANCE_1;
-    transfer_bytes[8]  = HOLD_TIME_0;
-    transfer_bytes[9]  = HOLD_TIME_1;
-    transfer_bytes[10] = SWIPE_TIME_0;
-    transfer_bytes[11] = SWIPE_TIME_1;
-    transfer_bytes[12] = SWIPE_X_DISTANCE_0;
-    transfer_bytes[13] = SWIPE_X_DISTANCE_1;
-    transfer_bytes[14] = SWIPE_Y_DISTANCE_0;
-    transfer_bytes[15] = SWIPE_Y_DISTANCE_1;
-    transfer_bytes[16] = SWIPE_X_CONS_DIST_0;
-    transfer_bytes[17] = SWIPE_X_CONS_DIST_1;
-    transfer_bytes[18] = SWIPE_Y_CONS_DIST_0;
-    transfer_bytes[19] = SWIPE_Y_CONS_DIST_1;
-    transfer_bytes[20] = SWIPE_ANGLE;
-    transfer_bytes[21] = PALM_THRESHOLD;
-    ret |= iqs7211e_i2c_write_reg(dev, IQS7211E_MM_GESTURE_ENABLE, transfer_bytes, 22);
-    LOG_DBG("\t11. Write Gesture Settings");
-
-    // 12. Write Rx Tx Map Settings (0x56 - 0x5C)
-    iqs7211e_wait_for_ready(dev, 100);
-    transfer_bytes[0]  = RX_TX_MAP_0;
-    transfer_bytes[1]  = RX_TX_MAP_1;
-    transfer_bytes[2]  = RX_TX_MAP_2;
-    transfer_bytes[3]  = RX_TX_MAP_3;
-    transfer_bytes[4]  = RX_TX_MAP_4;
-    transfer_bytes[5]  = RX_TX_MAP_5;
-    transfer_bytes[6]  = RX_TX_MAP_6;
-    transfer_bytes[7]  = RX_TX_MAP_7;
-    transfer_bytes[8]  = RX_TX_MAP_8;
-    transfer_bytes[9]  = RX_TX_MAP_9;
-    transfer_bytes[10] = RX_TX_MAP_10;
-    transfer_bytes[11] = RX_TX_MAP_11;
-    transfer_bytes[12] = RX_TX_MAP_12;
-    transfer_bytes[13] = RX_TX_MAP_FILLER;
-    ret |= iqs7211e_i2c_write_reg(dev, IQS7211E_MM_RX_TX_MAPPING_0_1, transfer_bytes, 14);
-    LOG_DBG("\t12. Write Rx Tx Map Settings");
-
-    // 13. Write Cycle 0 - 9 Settings (0x5D - 0x6B)
-    iqs7211e_wait_for_ready(dev, 100);
-    transfer_bytes[0]  = PLACEHOLDER_0;
-    transfer_bytes[1]  = CH_1_CYCLE_0;
-    transfer_bytes[2]  = CH_2_CYCLE_0;
-    transfer_bytes[3]  = PLACEHOLDER_1;
-    transfer_bytes[4]  = CH_1_CYCLE_1;
-    transfer_bytes[5]  = CH_2_CYCLE_1;
-    transfer_bytes[6]  = PLACEHOLDER_2;
-    transfer_bytes[7]  = CH_1_CYCLE_2;
-    transfer_bytes[8]  = CH_2_CYCLE_2;
-    transfer_bytes[9]  = PLACEHOLDER_3;
-    transfer_bytes[10] = CH_1_CYCLE_3;
-    transfer_bytes[11] = CH_2_CYCLE_3;
-    transfer_bytes[12] = PLACEHOLDER_4;
-    transfer_bytes[13] = CH_1_CYCLE_4;
-    transfer_bytes[14] = CH_2_CYCLE_4;
-    transfer_bytes[15] = PLACEHOLDER_5;
-    transfer_bytes[16] = CH_1_CYCLE_5;
-    transfer_bytes[17] = CH_2_CYCLE_5;
-    transfer_bytes[18] = PLACEHOLDER_6;
-    transfer_bytes[19] = CH_1_CYCLE_6;
-    transfer_bytes[20] = CH_2_CYCLE_6;
-    transfer_bytes[21] = PLACEHOLDER_7;
-    transfer_bytes[22] = CH_1_CYCLE_7;
-    transfer_bytes[23] = CH_2_CYCLE_7;
-    transfer_bytes[24] = PLACEHOLDER_8;
-    transfer_bytes[25] = CH_1_CYCLE_8;
-    transfer_bytes[26] = CH_2_CYCLE_8;
-    transfer_bytes[27] = PLACEHOLDER_9;
-    transfer_bytes[28] = CH_1_CYCLE_9;
-    transfer_bytes[29] = CH_2_CYCLE_9;
-    ret |= iqs7211e_i2c_write_reg(dev, IQS7211E_MM_PROXA_CYCLE0, transfer_bytes, 30);
-    LOG_DBG("\t13. Write Cycle 0 - 9 Settings");
-
-    // 14. Write Cycle 10 - 19 Settings (0x6C - 0x7A)
-    iqs7211e_wait_for_ready(dev, 100);
-    transfer_bytes[0]  = PLACEHOLDER_10;
-    transfer_bytes[1]  = CH_1_CYCLE_10;
-    transfer_bytes[2]  = CH_2_CYCLE_10;
-    transfer_bytes[3]  = PLACEHOLDER_11;
-    transfer_bytes[4]  = CH_1_CYCLE_11;
-    transfer_bytes[5]  = CH_2_CYCLE_11;
-    transfer_bytes[6]  = PLACEHOLDER_12;
-    transfer_bytes[7]  = CH_1_CYCLE_12;
-    transfer_bytes[8]  = CH_2_CYCLE_12;
-    transfer_bytes[9]  = PLACEHOLDER_13;
-    transfer_bytes[10] = CH_1_CYCLE_13;
-    transfer_bytes[11] = CH_2_CYCLE_13;
-    transfer_bytes[12] = PLACEHOLDER_14;
-    transfer_bytes[13] = CH_1_CYCLE_14;
-    transfer_bytes[14] = CH_2_CYCLE_14;
-    transfer_bytes[15] = PLACEHOLDER_15;
-    transfer_bytes[16] = CH_1_CYCLE_15;
-    transfer_bytes[17] = CH_2_CYCLE_15;
-    transfer_bytes[18] = PLACEHOLDER_16;
-    transfer_bytes[19] = CH_1_CYCLE_16;
-    transfer_bytes[20] = CH_2_CYCLE_16;
-    transfer_bytes[21] = PLACEHOLDER_17;
-    transfer_bytes[22] = CH_1_CYCLE_17;
-    transfer_bytes[23] = CH_2_CYCLE_17;
-    transfer_bytes[24] = PLACEHOLDER_18;
-    transfer_bytes[25] = CH_1_CYCLE_18;
-    transfer_bytes[26] = CH_2_CYCLE_18;
-    transfer_bytes[27] = PLACEHOLDER_19;
-    transfer_bytes[28] = CH_1_CYCLE_19;
-    transfer_bytes[29] = CH_2_CYCLE_19;
-    ret |= iqs7211e_i2c_write_reg(dev, IQS7211E_MM_PROXA_CYCLE10, transfer_bytes, 30);
-    LOG_DBG("\t14. Write Cycle 10 - 19 Settings");
-
-    // 15. Write Cycle 20 Settings (0x7B - 0x7C)
-    iqs7211e_wait_for_ready(dev, 100);
-    transfer_bytes[0] = PLACEHOLDER_20;
-    transfer_bytes[1] = CH_1_CYCLE_20;
-    transfer_bytes[2] = CH_2_CYCLE_20;
-    ret |= iqs7211e_i2c_write_reg(dev, IQS7211E_MM_PROXA_CYCLE20, transfer_bytes, 3);
-    LOG_DBG("\t15. Write Cycle 20 Settings");
-    
     LOG_DBG("Memory map write complete, status: %d", ret);
     return ret;
 }
@@ -711,6 +490,7 @@ static void iqs7211e_motion_handler(const struct device *gpio_dev, struct gpio_c
 
 static int iqs7211e_configure(const struct device *dev) {
     struct iqs7211e_data *data = dev->data;
+    const struct iqs7211e_config *cfg = dev->config;
     int ret;
     
     LOG_DBG("Initialization started");
@@ -774,7 +554,13 @@ static int iqs7211e_configure(const struct device *dev) {
                         return ret;
                     }
                     
-                    k_sleep(K_MSEC(ACTIVE_MODE_REPORT_RATE_0 + 1));
+                    /* Sleep using the active mode report rate from init data if present */
+                    {
+                        uint8_t len = 0;
+                        const uint8_t *rec = iqs7211e_find_init_record(cfg, IQS7211E_MM_ACTIVE_MODE_RR, &len);
+                        uint32_t sleep_ms = (uint32_t)rec[0] + 1;
+                        k_sleep(K_MSEC(sleep_ms));
+                    }
                     
                     data->init_complete = true;
                     LOG_DBG("Init complete");
@@ -952,11 +738,26 @@ static int iqs7211e_pm_action(const struct device *dev, enum pm_device_action ac
 }
 #endif
 
+/* If a device-tree node provides `init-symbol` and `init-length`,
+ * use that C symbol as the init data for the instance. The
+ * DT property name in DTS is `init-symbol` but DT macros use
+ * an underscore variant `init_symbol`.
+ */
 #define IQS7211E_INIT(n)                                                                           \
+    extern const uint8_t iqs7211e_init_default[];                                                   \
+    COND_CODE_1(DT_INST_NODE_HAS_PROP(n, init_symbol),                                           \
+        (extern const uint8_t DT_PROP(DT_DRV_INST(n), init_symbol_STRING_UNQUOTED )[];),                           \
+        ())                                                                                       \
     static const struct iqs7211e_config iqs7211e_cfg_##n = {                                      \
         .i2c = I2C_DT_SPEC_INST_GET(n),                                                           \
         .irq_gpio = GPIO_DT_SPEC_INST_GET(n, irq_gpios),                                          \
         .power_gpio = GPIO_DT_SPEC_INST_GET_OR(n, power_gpios, {0}),                              \
+        .init_data = COND_CODE_1(DT_INST_NODE_HAS_PROP(n, init_symbol),                           \
+            (DT_PROP(DT_DRV_INST(n), init_symbol_STRING_UNQUOTED )),                                               \
+            (iqs7211e_init_default)),                                                             \
+        .init_len = COND_CODE_1(DT_INST_NODE_HAS_PROP(n, init_symbol),                             \
+            (DT_PROP(DT_DRV_INST(n), init_length)),                                               \
+            IQS7211E_INIT_DATA_LEN),                                                         \
     };                                                                                             \
                                                                                                    \
     static struct iqs7211e_data iqs7211e_data_##n;                                                \

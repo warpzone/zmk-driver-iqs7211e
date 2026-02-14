@@ -126,6 +126,48 @@ IQS7211Eはデフォルトで I2Cアドレス `0x56` を使用します。
 
 これらの設定は使用するトラックパッドの構成に合わせて変更してください。デフォルトでは[低消費電力円形トラックパッド](https://nogikes.booth.pm/items/7254791)用の設定になっています。
 
+インスタンスごとの初期化データ（シンボル指定）
+
+- 各デバイスツリーのノードに `init-symbol` と `init-length` プロパティを追加することで、そのノード専用の初期化データ（C シンボル）を指定できます。
+- `init-symbol` は C 側で定義された `const uint8_t` 配列の識別子（C識別子）を指し、`init-length` はその配列のバイト長を指定します。
+- 例（`.overlay` または board `.dtsi`）:
+
+```dts
+&i2c0 {
+  trackpad0: trackpad@56 {
+    status = "okay";
+    compatible = "azoteq,iqs7211e";
+    reg = <0x56>;
+    irq-gpios = <&gpio0 21 GPIO_ACTIVE_LOW>;
+    init-symbol = "trackpad0_iqs7211e_init";
+  };
+};
+
+&i2c1 {
+  trackpad1: trackpad@56 {
+    status = "okay";
+    compatible = "azoteq,iqs7211e";
+    reg = <0x56>;
+    irq-gpios = <&gpio0 22 GPIO_ACTIVE_LOW>;
+    init-symbol = "trackpad1_iqs7211e_init";
+  };
+};
+```
+
+- 指定したシンボルはボード/プロジェクト側で次のように定義してください（例）:
+
+```c
+// board/init_data.c
+#include <stdint.h>
+const uint8_t trackpad0_iqs7211e_init[] = { /* レコード形式の初期化データ */ };
+```
+
+- フォールバック: `init-symbol` を指定しない場合、ドライバはモジュール内で提供する既定シンボル `iqs7211e_init_default`を使用します。
+
+- 初期化データ形式:
+  - ドライバは各レコードを `[register_addr, length, data...]` の繰り返しで処理します。
+  - 各レコードはそのレジスタアドレスへ `length` バイトのブロック書き込みを行います。
+
 ## トラブルシューティング
 
 ### デバイスが見つからない

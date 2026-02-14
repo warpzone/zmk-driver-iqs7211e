@@ -11,11 +11,35 @@ properties:
   irq-gpios:
     type: phandle-array
     required: true
-    description:
+    description: |
       GPIO connected to the motion pin, active low.
 
   power-gpios:
     type: phandle-array
     required: false
-    description:
+    description: |
       GPIO connected to the power control pin.
+
+  init-symbol:
+    type: string
+    required: false
+    default: "iqs7211e_init_default"
+    description: |
+      C identifier (symbol) name of a `const uint8_t` array defined in the
+      board/project code which contains the initialization records for this
+      instance. The driver will reference this symbol as the init data for
+      the instance.
+
+      Example value: "trackpad0_iqs7211e_init"  (do NOT quote as a C string
+      in the YAML; the value is the identifier itself).
+      Provide `init-length` (integer) with the byte length of the array.
+      If `init-symbol` is not set for a node, the driver uses the module's
+      default symbol `iqs7211e_init_default` defined in the driver.
+
+  init-length:
+    type: int
+    required: false
+    default: 217
+    description: |
+      Length in bytes of the `init-symbol` array. Required when `init-symbol`
+      is provided.
