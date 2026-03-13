@@ -43,3 +43,18 @@ properties:
     description: |
       Length in bytes of the `init-symbol` array. Required when `init-symbol`
       is provided.
+
+  scroller-mode:
+    type: boolean
+    required: false
+    description: |
+      When present, finger movement is reported as `INPUT_REL_WHEEL`
+      instead of pointer X/Y movement. Tap-to-click behavior remains active.
+
+  v-invert:
+    type: boolean
+    required: false
+    description: |
+      In scroller mode, invert vertical wheel direction.
+      When present, upward/downward finger movement direction is swapped
+      for `INPUT_REL_WHEEL` reports.

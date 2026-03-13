@@ -29,6 +29,12 @@ LOG_MODULE_REGISTER(iqs7211e, CONFIG_ZMK_LOG_LEVEL);
 #define IQS7211E_TIMEOUT_MS 100
 #define IQS7211E_RESET_DELAY_MS 50
 #define IQS7211E_ATI_TIMEOUT_CYCLES 600 // 30 seconds at 50ms intervals
+#define IQS7211E_INERTIA_TICK_MS 10
+#define IQS7211E_Q8_SHIFT 8
+#define IQS7211E_Q8_ONE (1 << IQS7211E_Q8_SHIFT)
+#define IQS7211E_SCROLL_AXIS_NONE 0
+#define IQS7211E_SCROLL_AXIS_VERTICAL 1
+#define IQS7211E_SCROLL_AXIS_HORIZONTAL 2
 
 struct iqs7211e_config {
     struct i2c_dt_spec i2c;
@@ -36,6 +42,8 @@ struct iqs7211e_config {
     struct gpio_dt_spec power_gpio;
     const uint8_t *init_data;
     size_t init_len;
+    bool scroller_mode;
+    bool v_invert;
 };
 
 struct iqs7211e_data {
@@ -58,7 +66,283 @@ struct iqs7211e_data {
     int16_t finger_2_prev_x, finger_2_prev_y;
     bool finger_2_prev_valid;
     uint8_t pending_click_type; // 0=none, 1=left, 2=right
+    bool scroll_was_active;
+    uint16_t x_resolution;
+    uint16_t y_resolution;
+    bool resolution_valid;
+    bool gesture_started_near_edge;
+    uint8_t scroller_axis_lock;
+#if defined(CONFIG_IQS7211E_SCROLLER_INERTIA) && CONFIG_IQS7211E_SCROLLER_INERTIA
+    struct k_work_delayable inertia_work;
+    int32_t inertia_wheel_velocity_q8;
+    int32_t inertia_hwheel_velocity_q8;
+    int32_t inertia_wheel_remainder_q8;
+    int32_t inertia_hwheel_remainder_q8;
+    int64_t inertia_last_wheel_time;
+    int64_t inertia_last_hwheel_time;
+    bool inertia_running;
+#endif
 };
+
+static bool iqs7211e_is_near_edge(const struct iqs7211e_data *data, uint16_t x, uint16_t y) {
+    uint32_t margin_x;
+    uint32_t margin_y;
+
+    if (CONFIG_IQS7211E_TAP_EDGE_MARGIN_PERMILLE == 0) {
+        return false;
+    }
+
+    if (!data->resolution_valid || data->x_resolution == 0 || data->y_resolution == 0) {
+        return false;
+    }
+
+    margin_x = ((uint32_t)data->x_resolution * CONFIG_IQS7211E_TAP_EDGE_MARGIN_PERMILLE) / 1000;
+    margin_y = ((uint32_t)data->y_resolution * CONFIG_IQS7211E_TAP_EDGE_MARGIN_PERMILLE) / 1000;
+
+    if (margin_x == 0) {
+        margin_x = 1;
+    }
+    if (margin_y == 0) {
+        margin_y = 1;
+    }
+
+    if (x <= margin_x || y <= margin_y) {
+        return true;
+    }
+
+    if ((uint32_t)x >= ((uint32_t)data->x_resolution - margin_x) ||
+        (uint32_t)y >= ((uint32_t)data->y_resolution - margin_y)) {
+        return true;
+    }
+
+    return false;
+}
+
+static bool iqs7211e_is_hwheel_zone(const struct iqs7211e_data *data, uint16_t y) {
+    uint32_t zone_min_permille = CONFIG_IQS7211E_SCROLLER_HWHEEL_ZONE_MIN_PERMILLE;
+    uint32_t zone_max_permille = CONFIG_IQS7211E_SCROLLER_HWHEEL_ZONE_MAX_PERMILLE;
+    uint32_t zone_start;
+    uint32_t zone_end;
+
+    if (!data->resolution_valid || data->y_resolution == 0) {
+        return false;
+    }
+
+    if (zone_min_permille > zone_max_permille) {
+        uint32_t tmp = zone_min_permille;
+        zone_min_permille = zone_max_permille;
+        zone_max_permille = tmp;
+    }
+
+    zone_start = ((uint32_t)data->y_resolution * zone_min_permille) / 1000;
+    zone_end = ((uint32_t)data->y_resolution * zone_max_permille) / 1000;
+
+    if (zone_start > data->y_resolution) {
+        zone_start = data->y_resolution;
+    }
+    if (zone_end > data->y_resolution) {
+        zone_end = data->y_resolution;
+    }
+
+    if (zone_end <= zone_start) {
+        return false;
+    }
+
+    return (uint32_t)y >= zone_start && (uint32_t)y < zone_end;
+}
+
+static int16_t iqs7211e_vertical_scroll_delta(const struct iqs7211e_config *cfg, int16_t y_movement) {
+    return cfg->v_invert ? y_movement : -y_movement;
+}
+
+#if defined(CONFIG_IQS7211E_SCROLLER_INERTIA) && CONFIG_IQS7211E_SCROLLER_INERTIA
+static int32_t iqs7211e_abs32(int32_t value) {
+    return (value < 0) ? -value : value;
+}
+
+static void iqs7211e_select_inertia_axis(struct iqs7211e_data *data, uint16_t axis,
+                                         int32_t **velocity_q8, int64_t **last_time) {
+    if (axis == INPUT_REL_HWHEEL) {
+        *velocity_q8 = &data->inertia_hwheel_velocity_q8;
+        *last_time = &data->inertia_last_hwheel_time;
+    } else {
+        *velocity_q8 = &data->inertia_wheel_velocity_q8;
+        *last_time = &data->inertia_last_wheel_time;
+    }
+}
+
+static void iqs7211e_stop_inertia_scroll(struct iqs7211e_data *data) {
+    data->inertia_running = false;
+    data->inertia_wheel_velocity_q8 = 0;
+    data->inertia_hwheel_velocity_q8 = 0;
+    data->inertia_wheel_remainder_q8 = 0;
+    data->inertia_hwheel_remainder_q8 = 0;
+    data->inertia_last_wheel_time = 0;
+    data->inertia_last_hwheel_time = 0;
+    (void)k_work_cancel_delayable(&data->inertia_work);
+}
+
+static void iqs7211e_update_inertia_velocity(struct iqs7211e_data *data, uint16_t axis,
+                                             int16_t wheel_delta, int64_t current_time) {
+    int32_t *velocity_q8;
+    int64_t *last_time;
+    int32_t sample_q8;
+
+    if (wheel_delta == 0) {
+        return;
+    }
+
+    iqs7211e_select_inertia_axis(data, axis, &velocity_q8, &last_time);
+
+    if (*last_time <= 0 || current_time <= *last_time) {
+        sample_q8 = (int32_t)wheel_delta << IQS7211E_Q8_SHIFT;
+    } else {
+        int64_t dt_ms = current_time - *last_time;
+
+        if (dt_ms < 1) {
+            dt_ms = 1;
+        }
+
+        sample_q8 = ((int32_t)wheel_delta << IQS7211E_Q8_SHIFT) * IQS7211E_INERTIA_TICK_MS / (int32_t)dt_ms;
+    }
+
+    // A light moving-average filter prevents abrupt speed jumps.
+    *velocity_q8 = (*velocity_q8 * 3 + sample_q8) / 4;
+    *last_time = current_time;
+}
+
+static void iqs7211e_inertia_work_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct iqs7211e_data *data = CONTAINER_OF(dwork, struct iqs7211e_data, inertia_work);
+    const struct device *dev = data->dev;
+    int32_t wheel_delta;
+    int32_t hwheel_delta;
+    bool wheel_active;
+    bool hwheel_active;
+
+    if (!data->inertia_running) {
+        return;
+    }
+
+    wheel_active = iqs7211e_abs32(data->inertia_wheel_velocity_q8) >=
+                   CONFIG_IQS7211E_SCROLLER_INERTIA_STOP_THRESHOLD_Q8;
+    hwheel_active = iqs7211e_abs32(data->inertia_hwheel_velocity_q8) >=
+                    CONFIG_IQS7211E_SCROLLER_INERTIA_STOP_THRESHOLD_Q8;
+
+    if (!wheel_active) {
+        data->inertia_wheel_velocity_q8 = 0;
+        data->inertia_wheel_remainder_q8 = 0;
+    }
+    if (!hwheel_active) {
+        data->inertia_hwheel_velocity_q8 = 0;
+        data->inertia_hwheel_remainder_q8 = 0;
+    }
+
+    if (!wheel_active && !hwheel_active) {
+        iqs7211e_stop_inertia_scroll(data);
+        return;
+    }
+
+    data->inertia_wheel_remainder_q8 += data->inertia_wheel_velocity_q8;
+    wheel_delta = data->inertia_wheel_remainder_q8 / IQS7211E_Q8_ONE;
+    data->inertia_wheel_remainder_q8 -= wheel_delta * IQS7211E_Q8_ONE;
+
+    data->inertia_hwheel_remainder_q8 += data->inertia_hwheel_velocity_q8;
+    hwheel_delta = data->inertia_hwheel_remainder_q8 / IQS7211E_Q8_ONE;
+    data->inertia_hwheel_remainder_q8 -= hwheel_delta * IQS7211E_Q8_ONE;
+
+    if (wheel_delta != 0) {
+        input_report_rel(dev, INPUT_REL_WHEEL, wheel_delta, true, K_FOREVER);
+    }
+    if (hwheel_delta != 0) {
+        input_report_rel(dev, INPUT_REL_HWHEEL, hwheel_delta, true, K_FOREVER);
+    }
+
+    data->inertia_wheel_velocity_q8 =
+        (data->inertia_wheel_velocity_q8 * CONFIG_IQS7211E_SCROLLER_INERTIA_DECAY_PERMILLE) / 1000;
+    data->inertia_hwheel_velocity_q8 =
+        (data->inertia_hwheel_velocity_q8 * CONFIG_IQS7211E_SCROLLER_INERTIA_DECAY_PERMILLE) / 1000;
+
+    if (iqs7211e_abs32(data->inertia_wheel_velocity_q8) <
+            CONFIG_IQS7211E_SCROLLER_INERTIA_STOP_THRESHOLD_Q8 &&
+        iqs7211e_abs32(data->inertia_hwheel_velocity_q8) <
+            CONFIG_IQS7211E_SCROLLER_INERTIA_STOP_THRESHOLD_Q8) {
+        iqs7211e_stop_inertia_scroll(data);
+        return;
+    }
+
+    (void)k_work_schedule(&data->inertia_work, K_MSEC(IQS7211E_INERTIA_TICK_MS));
+}
+
+static void iqs7211e_start_inertia_scroll(struct iqs7211e_data *data) {
+    bool wheel_active = iqs7211e_abs32(data->inertia_wheel_velocity_q8) >=
+                        CONFIG_IQS7211E_SCROLLER_INERTIA_STOP_THRESHOLD_Q8;
+    bool hwheel_active = iqs7211e_abs32(data->inertia_hwheel_velocity_q8) >=
+                         CONFIG_IQS7211E_SCROLLER_INERTIA_STOP_THRESHOLD_Q8;
+
+    if (!wheel_active) {
+        data->inertia_wheel_velocity_q8 = 0;
+        data->inertia_wheel_remainder_q8 = 0;
+    }
+    if (!hwheel_active) {
+        data->inertia_hwheel_velocity_q8 = 0;
+        data->inertia_hwheel_remainder_q8 = 0;
+    }
+
+    if (!wheel_active && !hwheel_active) {
+        return;
+    }
+
+    data->inertia_running = true;
+    (void)k_work_schedule(&data->inertia_work, K_MSEC(IQS7211E_INERTIA_TICK_MS));
+}
+#endif
+
+static void iqs7211e_report_scroll(struct iqs7211e_data *data, uint16_t axis,
+                                   int16_t wheel_delta, int64_t current_time) {
+    if (wheel_delta == 0) {
+        return;
+    }
+
+    input_report_rel(data->dev, axis, wheel_delta, true, K_FOREVER);
+    data->scroll_was_active = true;
+
+#if defined(CONFIG_IQS7211E_SCROLLER_INERTIA) && CONFIG_IQS7211E_SCROLLER_INERTIA
+    iqs7211e_update_inertia_velocity(data, axis, wheel_delta, current_time);
+#else
+    ARG_UNUSED(axis);
+    ARG_UNUSED(current_time);
+#endif
+}
+
+static void iqs7211e_process_scroller_motion(struct iqs7211e_data *data,
+                                             const struct iqs7211e_config *cfg,
+                                             bool hwheel_zone,
+                                             int16_t x_movement,
+                                             int16_t y_movement,
+                                             int64_t current_time) {
+    int16_t v_delta = iqs7211e_vertical_scroll_delta(cfg, y_movement);
+
+    if (data->scroller_axis_lock == IQS7211E_SCROLL_AXIS_NONE) {
+        if (hwheel_zone && x_movement != 0 && abs(x_movement) > abs(y_movement)) {
+            data->scroller_axis_lock = IQS7211E_SCROLL_AXIS_HORIZONTAL;
+        } else if (v_delta != 0) {
+            data->scroller_axis_lock = IQS7211E_SCROLL_AXIS_VERTICAL;
+        } else if (hwheel_zone && x_movement != 0) {
+            data->scroller_axis_lock = IQS7211E_SCROLL_AXIS_HORIZONTAL;
+        }
+    }
+
+    if (data->scroller_axis_lock == IQS7211E_SCROLL_AXIS_HORIZONTAL) {
+        if (x_movement != 0) {
+            iqs7211e_report_scroll(data, INPUT_REL_HWHEEL, x_movement, current_time);
+        }
+    } else if (data->scroller_axis_lock == IQS7211E_SCROLL_AXIS_VERTICAL) {
+        if (v_delta != 0) {
+            iqs7211e_report_scroll(data, INPUT_REL_WHEEL, v_delta, current_time);
+        }
+    }
+}
 
 static int iqs7211e_i2c_read_reg(const struct device *dev, uint8_t reg, uint8_t *data, uint8_t len) {
     const struct iqs7211e_config *cfg = dev->config;
@@ -238,6 +522,25 @@ static const uint8_t *iqs7211e_find_init_record(const struct iqs7211e_config *cf
     return NULL;
 }
 
+static bool iqs7211e_load_resolution_from_init(const struct iqs7211e_config *cfg,
+                                               struct iqs7211e_data *data) {
+    uint8_t len = 0;
+    const uint8_t *rec = iqs7211e_find_init_record(cfg, IQS7211E_MM_TP_RX_SETTINGS, &len);
+
+    if (rec == NULL || len < 8) {
+        data->resolution_valid = false;
+        data->x_resolution = 0;
+        data->y_resolution = 0;
+        return false;
+    }
+
+    data->x_resolution = ((uint16_t)rec[5] << 8) | rec[4];
+    data->y_resolution = ((uint16_t)rec[7] << 8) | rec[6];
+    data->resolution_valid = (data->x_resolution > 0) && (data->y_resolution > 0);
+
+    return data->resolution_valid;
+}
+
 static int iqs7211e_write_memory_map(const struct device *dev) {
     int ret = 0;
     const struct iqs7211e_config *cfg = dev->config;
@@ -366,6 +669,7 @@ static void iqs7211e_interrupt_disable(const struct device *dev) {
 static void iqs7211e_motion_work_handler(struct k_work *work) {
     struct iqs7211e_data *data = CONTAINER_OF(work, struct iqs7211e_data, motion_work);
     const struct device *dev = data->dev;
+    const struct iqs7211e_config *cfg = dev->config;
     azoteq_iqs7211e_base_data_t base_data = {0};
     int ret;
     int64_t current_time = k_uptime_get();
@@ -392,6 +696,12 @@ static void iqs7211e_motion_work_handler(struct k_work *work) {
     }
  
     uint8_t finger_count = base_data.info_flags[1] & 0x03;
+
+#if defined(CONFIG_IQS7211E_SCROLLER_INERTIA) && CONFIG_IQS7211E_SCROLLER_INERTIA
+    if (finger_count > 0 && data->inertia_running) {
+        iqs7211e_stop_inertia_scroll(data);
+    }
+#endif
     
     if (finger_count == 1) {
         // Single finger handling
@@ -403,12 +713,18 @@ static void iqs7211e_motion_work_handler(struct k_work *work) {
             data->tap_start_x = finger_1_x;
             data->tap_start_y = finger_1_y;
             data->last_touch_time = current_time;
+            data->scroll_was_active = false;
+            data->gesture_started_near_edge = iqs7211e_is_near_edge(data, finger_1_x, finger_1_y);
+            data->scroller_axis_lock = IQS7211E_SCROLL_AXIS_NONE;
         } else if (data->finger_2_prev_valid) {
             // Transitioning from two finger to one finger - reset position reference
             LOG_DBG("Transition from two finger to one finger - reset position");
             data->tap_start_x = finger_1_x;
             data->tap_start_y = finger_1_y;
             data->last_touch_time = current_time;
+            data->scroll_was_active = false;
+            data->gesture_started_near_edge = iqs7211e_is_near_edge(data, finger_1_x, finger_1_y);
+            data->scroller_axis_lock = IQS7211E_SCROLL_AXIS_NONE;
             // Reset tap state to allow normal single finger gestures
             data->tap_count = 0;
             data->double_tap_hold = false;
@@ -417,10 +733,15 @@ static void iqs7211e_motion_work_handler(struct k_work *work) {
             // Normal single finger movement
             int16_t x = finger_1_x - data->previous_x;
             int16_t y = finger_1_y - data->previous_y;
-            
-            LOG_DBG("Movement: x=%4d y=%4d", x, y);
-            input_report_rel(dev, INPUT_REL_X, x, false, K_FOREVER);
-            input_report_rel(dev, INPUT_REL_Y, y, true, K_FOREVER);
+
+            if (cfg->scroller_mode) {
+                bool hwheel_zone = iqs7211e_is_hwheel_zone(data, finger_1_y);
+                iqs7211e_process_scroller_motion(data, cfg, hwheel_zone, x, y, current_time);
+            } else {
+                LOG_DBG("Movement: x=%4d y=%4d", x, y);
+                input_report_rel(dev, INPUT_REL_X, x, false, K_FOREVER);
+                input_report_rel(dev, INPUT_REL_Y, y, true, K_FOREVER);
+            }
         }
         
         data->previous_x = finger_1_x;
@@ -442,6 +763,10 @@ static void iqs7211e_motion_work_handler(struct k_work *work) {
         if (!data->finger_2_prev_valid) {
             // Two finger touch start
             data->last_touch_time = current_time;
+            data->scroll_was_active = false;
+            data->gesture_started_near_edge = iqs7211e_is_near_edge(data, finger_1_x, finger_1_y) ||
+                                              iqs7211e_is_near_edge(data, finger_2_x, finger_2_y);
+            data->scroller_axis_lock = IQS7211E_SCROLL_AXIS_NONE;
             // Reset single finger tap state when starting two finger gesture
             data->tap_count = 0;
             data->double_tap_hold = false;
@@ -453,14 +778,21 @@ static void iqs7211e_motion_work_handler(struct k_work *work) {
             // Two finger movement - scroll
             int16_t y_movement = (finger_1_y + finger_2_y) / 2 - (data->previous_y + data->finger_2_prev_y) / 2;
             int16_t x_movement = (finger_1_x + finger_2_x) / 2 - (data->previous_x + data->finger_2_prev_x) / 2;
-            
-            if (abs(y_movement) > 0) {
-                LOG_DBG("Scroll Y: %d", -y_movement);
-                input_report_rel(dev, INPUT_REL_WHEEL, -y_movement, true, K_FOREVER);
-            }
-            if (abs(x_movement) > 0) {
-                LOG_DBG("Scroll X: %d", x_movement);
-                input_report_rel(dev, INPUT_REL_HWHEEL, x_movement, true, K_FOREVER);
+
+            if (cfg->scroller_mode) {
+                uint16_t avg_y = (finger_1_y + finger_2_y) / 2;
+                bool hwheel_zone = iqs7211e_is_hwheel_zone(data, avg_y);
+                iqs7211e_process_scroller_motion(data, cfg, hwheel_zone, x_movement, y_movement,
+                                                current_time);
+            } else {
+                if (abs(y_movement) > 0) {
+                    LOG_DBG("Scroll Y: %d", -y_movement);
+                    input_report_rel(dev, INPUT_REL_WHEEL, -y_movement, true, K_FOREVER);
+                }
+                if (abs(x_movement) > 0) {
+                    LOG_DBG("Scroll X: %d", x_movement);
+                    input_report_rel(dev, INPUT_REL_HWHEEL, x_movement, true, K_FOREVER);
+                }
             }
         }
         
@@ -475,6 +807,18 @@ static void iqs7211e_motion_work_handler(struct k_work *work) {
         // No fingers - handle touch end events
         if (data->previous_valid || data->finger_2_prev_valid) {
             int64_t touch_duration = current_time - data->last_touch_time;
+            bool ended_near_edge = false;
+            bool tap_allowed;
+
+            if (data->previous_valid) {
+                ended_near_edge = iqs7211e_is_near_edge(data, data->previous_x, data->previous_y);
+            }
+            if (data->finger_2_prev_valid) {
+                ended_near_edge = ended_near_edge ||
+                                  iqs7211e_is_near_edge(data, data->finger_2_prev_x, data->finger_2_prev_y);
+            }
+
+            tap_allowed = !(data->gesture_started_near_edge || ended_near_edge);
             
             if (data->finger_2_prev_valid) {
                 // Two finger tap - right click
@@ -487,8 +831,10 @@ static void iqs7211e_motion_work_handler(struct k_work *work) {
             } else if (data->previous_valid) {
                 // Single finger tap handling
                 int16_t tap_distance = abs(data->previous_x - data->tap_start_x) + abs(data->previous_y - data->tap_start_y);
+
+                LOG_DBG("Touch duration: %lld ms, tap distance: %d, tap count: %d", touch_duration, tap_distance, data->tap_count);
                 
-                if (touch_duration < 200 && tap_distance < 50) { // Quick tap with minimal movement
+                if (tap_allowed && touch_duration < 200 && tap_distance < 50) { // Quick tap with minimal movement
                     int64_t tap_interval = current_time - data->last_tap_time;
                     
                     if (tap_interval < 400 && data->tap_count == 1) { // Double tap
@@ -514,6 +860,10 @@ static void iqs7211e_motion_work_handler(struct k_work *work) {
                     data->double_tap_hold = false;
                     data->is_clicking = false;
                     input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
+                } else if (!tap_allowed) {
+                    LOG_DBG("Single finger tap ignored near sensor edge");
+                    data->tap_count = 0;
+                    data->double_tap_hold = false;
                 }
                 
                 // Reset tap count if too much time passed
@@ -522,9 +872,18 @@ static void iqs7211e_motion_work_handler(struct k_work *work) {
                 }
             }
         }
+
+#if defined(CONFIG_IQS7211E_SCROLLER_INERTIA) && CONFIG_IQS7211E_SCROLLER_INERTIA
+        if (cfg->scroller_mode && data->scroll_was_active) {
+            iqs7211e_start_inertia_scroll(data);
+        }
+#endif
         
         data->previous_valid = false;
         data->finger_2_prev_valid = false;
+        data->scroll_was_active = false;
+        data->gesture_started_near_edge = false;
+        data->scroller_axis_lock = IQS7211E_SCROLL_AXIS_NONE;
     }
 
     iqs7211e_interrupt_enable(dev);
@@ -651,9 +1010,32 @@ static int iqs7211e_init(const struct device *dev) {
     data->init_complete = false;
     data->previous_valid = false;
     data->pending_click_type = 0;
+    data->scroll_was_active = false;
+    data->x_resolution = 0;
+    data->y_resolution = 0;
+    data->resolution_valid = false;
+    data->gesture_started_near_edge = false;
+    data->scroller_axis_lock = IQS7211E_SCROLL_AXIS_NONE;
+
+    if (!iqs7211e_load_resolution_from_init(cfg, data)) {
+        LOG_WRN("Failed to parse X/Y resolution from init data, edge tap suppression disabled");
+    }
+
+#if defined(CONFIG_IQS7211E_SCROLLER_INERTIA) && CONFIG_IQS7211E_SCROLLER_INERTIA
+    data->inertia_wheel_velocity_q8 = 0;
+    data->inertia_hwheel_velocity_q8 = 0;
+    data->inertia_wheel_remainder_q8 = 0;
+    data->inertia_hwheel_remainder_q8 = 0;
+    data->inertia_last_wheel_time = 0;
+    data->inertia_last_hwheel_time = 0;
+    data->inertia_running = false;
+#endif
     
     k_work_init(&data->motion_work, iqs7211e_motion_work_handler);
     k_work_init_delayable(&data->click_work, iqs7211e_click_work_handler);
+#if defined(CONFIG_IQS7211E_SCROLLER_INERTIA) && CONFIG_IQS7211E_SCROLLER_INERTIA
+    k_work_init_delayable(&data->inertia_work, iqs7211e_inertia_work_handler);
+#endif
     
 #if DT_INST_NODE_HAS_PROP(0, power_gpios)
     if (gpio_is_ready_dt(&cfg->power_gpio)) {
@@ -739,6 +1121,10 @@ static int iqs7211e_pm_action(const struct device *dev, enum pm_device_action ac
         }
 
         iqs7211e_suspend(dev);
+
+    #if defined(CONFIG_IQS7211E_SCROLLER_INERTIA) && CONFIG_IQS7211E_SCROLLER_INERTIA
+        iqs7211e_stop_inertia_scroll(data);
+    #endif
         
         data->init_complete = false;
         break;
@@ -796,6 +1182,8 @@ static int iqs7211e_pm_action(const struct device *dev, enum pm_device_action ac
         .init_len = COND_CODE_1(DT_INST_NODE_HAS_PROP(n, init_symbol),                             \
             (DT_PROP(DT_DRV_INST(n), init_length)),                                               \
             IQS7211E_INIT_DATA_LEN),                                                         \
+        .scroller_mode = DT_INST_PROP_OR(n, scroller_mode, false),                                  \
+        .v_invert = DT_INST_PROP_OR(n, v_invert, false),                                        \
     };                                                                                             \
                                                                                                    \
     static struct iqs7211e_data iqs7211e_data_##n;                                                \
