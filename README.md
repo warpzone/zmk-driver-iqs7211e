@@ -74,6 +74,8 @@ manifest:
         reg = <0x56>;
         irq-gpios = <&gpio0 21 GPIO_PULL_UP>;
         power-gpios = <&gpio0 22 GPIO_ACTIVE_HIGH>;
+        scroller-mode;
+        // v-invert;
     };
 };
 ```
@@ -98,6 +100,39 @@ endif
 
 - `irq-gpios`: RDY/モーションピンに接続されたGPIO（必須、アクティブロー）
 - `power-gpios`: 電源制御ピンに接続されたGPIO（任意、アクティブハイ）
+- `scroller-mode`: 指移動を `INPUT_REL_WHEEL` として送出する（任意）
+- `v-invert`: `scroller-mode` 時の縦スクロール方向を反転する（任意）
+
+### Scroller mode と慣性スクロール
+
+- `scroller-mode` を指定すると、指移動はカーソル移動ではなくホイール入力として送出されます。
+- タップによるクリック（1本指タップ=左クリック、2本指タップ=右クリック）はそのまま有効です。
+- `scroller-mode` では、`HWheel` ゾーン内で横移動すると `INPUT_REL_HWHEEL` を送出します。
+- `HWheel` ゾーンは Kconfig の `MIN/MAX` で帯域を指定し、上側基準/下側基準を切り替えできます。
+- `scroller-mode` では、スクロール開始後の軸を固定します。
+  `V scroll` 中に H ゾーンへ入っても `H scroll` へ切り替わらず、逆も同様です。
+- 慣性スクロールはKconfigで制御します。
+
+```kconfig
+CONFIG_IQS7211E_TAP_EDGE_MARGIN_PERMILLE=80
+CONFIG_IQS7211E_SCROLLER_HWHEEL_ZONE_MIN_PERMILLE=0
+CONFIG_IQS7211E_SCROLLER_HWHEEL_ZONE_MAX_PERMILLE=150
+CONFIG_IQS7211E_SCROLLER_HWHEEL_ZONE_FROM_BOTTOM=n
+```
+
+- `IQS7211E_TAP_EDGE_MARGIN_PERMILLE`: 周辺タップ無効のマージン（permille）。
+- `IQS7211E_SCROLLER_HWHEEL_ZONE_MIN_PERMILLE`, `MAX`: `HWheel` 帯域を `[MIN, MAX)` で指定。
+- `IQS7211E_SCROLLER_HWHEEL_ZONE_FROM_BOTTOM`: `n` で上側基準、`y` で下側基準。
+
+```kconfig
+CONFIG_IQS7211E_SCROLLER_INERTIA=y
+CONFIG_IQS7211E_SCROLLER_INERTIA_DECAY_PERMILLE=920
+CONFIG_IQS7211E_SCROLLER_INERTIA_STOP_THRESHOLD_Q8=96
+```
+
+- 慣性スクロールの送出間隔は 10ms 固定です。
+- 慣性は `WHEEL` と `HWHEEL` の両方に同じ減衰特性で適用されます。
+- 実装は固定小数点（Q8）で、FPUを使いません。
 
 ## ハードウェアセットアップ
 
