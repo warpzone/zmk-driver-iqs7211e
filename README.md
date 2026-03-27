@@ -100,8 +100,9 @@ endif
 
 - `irq-gpios`: RDY/モーションピンに接続されたGPIO（必須、アクティブロー）
 - `power-gpios`: 電源制御ピンに接続されたGPIO（任意、アクティブハイ）
-- `scroller-mode`: 指移動を `INPUT_REL_WHEEL` として送出する（任意）
+- `scroller-mode`: 指移動を `INPUT_REL_WHEEL`, `INPUT_REL_HWHEEL` として送出する（任意）
 - `v-invert`: `scroller-mode` 時の縦スクロール方向を反転する（任意）
+- `h-invert`: `scroller-mode` 時の横スクロール方向を反転する（任意）
 
 ### Scroller mode と慣性スクロール
 

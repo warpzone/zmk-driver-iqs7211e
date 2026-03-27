@@ -58,3 +58,11 @@ properties:
       In scroller mode, invert vertical wheel direction.
       When present, upward/downward finger movement direction is swapped
       for `INPUT_REL_WHEEL` reports.
+
+  h-invert:
+    type: boolean
+    required: false
+    description: |
+      In scroller mode, invert horizontal wheel direction.
+      When present, left/right finger movement direction is swapped
+      for `INPUT_REL_HWHEEL` reports.
