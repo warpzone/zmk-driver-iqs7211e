@@ -45,6 +45,7 @@ struct iqs7211e_config {
     bool scroller_mode;
     bool v_invert;
     bool h_invert;
+    bool disable_tap_click;
 };
 
 struct iqs7211e_data {
@@ -822,6 +823,9 @@ static void iqs7211e_motion_work_handler(struct k_work *work) {
             }
 
             tap_allowed = !(data->gesture_started_near_edge || ended_near_edge);
+            if (cfg->disable_tap_click) {
+                tap_allowed = false;
+            }
             
             if (data->finger_2_prev_valid) {
                 // Two finger tap - right click
@@ -1188,6 +1192,7 @@ static int iqs7211e_pm_action(const struct device *dev, enum pm_device_action ac
         .scroller_mode = DT_INST_PROP_OR(n, scroller_mode, false),                                  \
         .v_invert = DT_INST_PROP_OR(n, v_invert, false),                                        \
         .h_invert = DT_INST_PROP_OR(n, h_invert, false),                                        \
+        .disable_tap_click = DT_INST_PROP_OR(n, disable_tap_click, false),                      \
     };                                                                                             \
                                                                                                    \
     static struct iqs7211e_data iqs7211e_data_##n;                                                \
