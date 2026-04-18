@@ -384,7 +384,7 @@ static void iqs7211e_wait_for_ready(const struct device *dev, uint16_t timeout_m
 }
 
 static int iqs7211e_get_base_data(const struct device *dev, azoteq_iqs7211e_base_data_t *base_data) {
-    uint8_t transfer_bytes[8];
+    uint8_t transfer_bytes[10];
     int ret;
     
     iqs7211e_wait_for_ready(dev, 50);
@@ -394,7 +394,7 @@ static int iqs7211e_get_base_data(const struct device *dev, azoteq_iqs7211e_base
         return -EIO;
     }
     
-    ret = iqs7211e_i2c_read_reg(dev, IQS7211E_MM_INFO_FLAGS, transfer_bytes, 8);
+    ret = iqs7211e_i2c_read_reg(dev, IQS7211E_MM_INFO_FLAGS, transfer_bytes, 10);
     if (ret < 0) {
         return ret;
     }
@@ -407,6 +407,8 @@ static int iqs7211e_get_base_data(const struct device *dev, azoteq_iqs7211e_base
     base_data->finger_1_y.h = transfer_bytes[5];
     base_data->finger_2_x.l = transfer_bytes[6];
     base_data->finger_2_x.h = transfer_bytes[7];
+    base_data->finger_2_y.l = transfer_bytes[8];
+    base_data->finger_2_y.h = transfer_bytes[9];
     
     return 0;
 }
@@ -759,11 +761,7 @@ static void iqs7211e_motion_work_handler(struct k_work *work) {
         uint16_t finger_1_x = AZOTEQ_IQS7211E_COMBINE_H_L_BYTES(base_data.finger_1_x.h, base_data.finger_1_x.l);
         uint16_t finger_1_y = AZOTEQ_IQS7211E_COMBINE_H_L_BYTES(base_data.finger_1_y.h, base_data.finger_1_y.l);
         uint16_t finger_2_x = AZOTEQ_IQS7211E_COMBINE_H_L_BYTES(base_data.finger_2_x.h, base_data.finger_2_x.l);
-        
-        // Read finger 2 Y coordinate (need additional read)
-        uint8_t finger_2_y_bytes[2];
-        ret = iqs7211e_i2c_read_reg(dev, IQS7211E_MM_FINGER_2_Y, finger_2_y_bytes, 2);
-        uint16_t finger_2_y = (ret == 0) ? AZOTEQ_IQS7211E_COMBINE_H_L_BYTES(finger_2_y_bytes[1], finger_2_y_bytes[0]) : 0;
+        uint16_t finger_2_y = AZOTEQ_IQS7211E_COMBINE_H_L_BYTES(base_data.finger_2_y.h, base_data.finger_2_y.l);
         
         if (!data->finger_2_prev_valid) {
             // Two finger touch start
