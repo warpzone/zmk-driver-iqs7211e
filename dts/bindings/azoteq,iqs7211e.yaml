@@ -66,3 +66,10 @@ properties:
       In scroller mode, invert horizontal wheel direction.
       When present, left/right finger movement direction is swapped
       for `INPUT_REL_HWHEEL` reports.
+
+  disable-tap-click:
+    type: boolean
+    required: false
+    description: |
+      Disable tap-to-click behavior for both one-finger and two-finger taps.
+      Movement and scroll reports remain active.
